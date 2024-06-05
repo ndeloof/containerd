@@ -405,12 +405,12 @@ func parseHostConfig(server string, baseDir string, config hostFileConfig) (host
 	)
 
 	if server != "" {
-		if !strings.HasPrefix(server, "http") {
-			server = "https://" + server
-		}
 		u, err := url.Parse(server)
 		if err != nil {
 			return hostConfig{}, fmt.Errorf("unable to parse server %v: %w", server, err)
+		}
+		if u.Scheme == "" {
+			u.Scheme = "https"
 		}
 		result.scheme = u.Scheme
 		result.host = u.Host
