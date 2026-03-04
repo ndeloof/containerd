@@ -20,16 +20,305 @@ package erofs
 
 import (
 	"context"
+	"fmt"
+	"io"
+	iofs "io/fs"
+	"os"
+	"path/filepath"
+	"strings"
 
+	cfs "github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	goerofs "github.com/erofs/go-erofs"
+	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/diff"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/internal/erofsutils"
+	"github.com/containerd/containerd/v2/pkg/archive"
+	"github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/containerd/v2/pkg/epoch"
+	"github.com/containerd/containerd/v2/pkg/labels"
 )
+
+// writeDiff generates the diff tar stream by extracting lower EROFS layers to a
+// temporary directory using go-erofs and then computing the diff against upperRoot.
+func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperRoot string) error {
+	tempDir, err := os.MkdirTemp("", "erofs-lower-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir for lower: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Collect EROFS blob paths from lower mounts.
+	// The snapshotter places individual EROFS mounts in ParentID order
+	// (index 0 = most recent parent, last = oldest ancestor), followed
+	// by an optional overlay mount. Apply oldest-first so newer layers
+	// overwrite older ones when building the merged lower.
+	var blobs []string
+	for _, mnt := range lower {
+		if mnt.Type == "erofs" {
+			blobs = append(blobs, mnt.Source)
+		}
+	}
+	for i := len(blobs) - 1; i >= 0; i-- {
+		if err := extractEROFSToDir(blobs[i], tempDir); err != nil {
+			return fmt.Errorf("failed to extract lower EROFS layer %s: %w", blobs[i], err)
+		}
+	}
+
+	cw := archive.NewChangeWriter(w, upperRoot)
+	if err := cfs.DiffDirChanges(ctx, tempDir, upperRoot, cfs.DiffSourceOverlayFS, cw.HandleChange); err != nil {
+		return fmt.Errorf("failed to create diff tar stream: %w", err)
+	}
+	return cw.Close()
+}
+
+// extractEROFSToDir extracts the contents of an EROFS image into destDir,
+// applying AUFS overlay whiteout semantics so that multiple layers can be
+// merged by calling this function repeatedly (oldest layer first).
+func extractEROFSToDir(blobPath, destDir string) error {
+	f, err := os.Open(blobPath)
+	if err != nil {
+		return fmt.Errorf("open EROFS blob: %w", err)
+	}
+	defer f.Close()
+
+	erofsFS, err := goerofs.EroFS(f)
+	if err != nil {
+		return fmt.Errorf("read EROFS image %s: %w", blobPath, err)
+	}
+
+	return iofs.WalkDir(erofsFS, ".", func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == "." {
+			return nil
+		}
+
+		name := filepath.Base(path)
+		// filepath.FromSlash converts the forward-slash paths produced by
+		// io/fs.WalkDir into the OS-native separator (a no-op on macOS).
+		destPath := filepath.Join(destDir, filepath.FromSlash(path))
+
+		// Handle AUFS whiteout markers used by mkfs.erofs --aufs.
+		if strings.HasPrefix(name, ".wh.") {
+			if name == ".wh..wh..opq" {
+				// Opaque whiteout: the directory is opaque in this layer;
+				// remove all lower content that was previously extracted.
+				parentDir := filepath.Dir(destPath)
+				entries, rerr := os.ReadDir(parentDir)
+				if rerr != nil {
+					if os.IsNotExist(rerr) {
+						return nil
+					}
+					return rerr
+				}
+				for _, e := range entries {
+					if err := os.RemoveAll(filepath.Join(parentDir, e.Name())); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			// Regular whiteout: delete the named entry from the merged tree.
+			toDelete := filepath.Join(filepath.Dir(destPath), strings.TrimPrefix(name, ".wh."))
+			if err := os.RemoveAll(toDelete); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		mode := info.Mode()
+
+		switch {
+		case mode.IsDir():
+			// A directory from a newer layer may overwrite a file from an
+			// older layer, so remove the old entry before creating the dir.
+			if err := os.RemoveAll(destPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return os.MkdirAll(destPath, mode.Perm())
+
+		case mode&iofs.ModeSymlink != 0:
+			// The symlink target is stored as the file's data in EROFS.
+			sf, err := erofsFS.Open(path)
+			if err != nil {
+				return fmt.Errorf("open symlink %s: %w", path, err)
+			}
+			target, err := io.ReadAll(sf)
+			sf.Close()
+			if err != nil {
+				return fmt.Errorf("read symlink target %s: %w", path, err)
+			}
+			os.Remove(destPath) // replace any existing entry
+			return os.Symlink(string(target), destPath)
+
+		case mode&iofs.ModeType == 0:
+			// Regular file.
+			os.Remove(destPath) // replace any existing entry
+			dst, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+			if err != nil {
+				return fmt.Errorf("create file %s: %w", destPath, err)
+			}
+			src, err := erofsFS.Open(path)
+			if err != nil {
+				dst.Close()
+				return fmt.Errorf("open EROFS file %s: %w", path, err)
+			}
+			_, copyErr := io.Copy(dst, src)
+			src.Close()
+			dst.Close()
+			return copyErr
+
+		default:
+			// Skip device nodes, named pipes, sockets, etc. — these cannot
+			// be created on non-Linux hosts without elevated privileges and
+			// are not meaningful for diff generation.
+			return nil
+		}
+	})
+}
 
 // Compare creates a diff between the given mounts and uploads the result
 // to the content store.
 func (s erofsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
-	return emptyDesc, errdefs.ErrNotImplemented
+	layer, err := erofsutils.MountsToLayer(upper)
+	if err != nil {
+		return emptyDesc, fmt.Errorf("unsupported layer for erofsDiff Compare method: %w", err)
+	}
+
+	var config diff.Config
+	for _, opt := range opts {
+		if err := opt(&config); err != nil {
+			return emptyDesc, err
+		}
+	}
+	if tm := epoch.FromContext(ctx); tm != nil && config.SourceDateEpoch == nil {
+		config.SourceDateEpoch = tm
+	}
+
+	if config.MediaType == "" {
+		config.MediaType = ocispec.MediaTypeImageLayerGzip
+	}
+
+	var compressionType compression.Compression
+	switch config.MediaType {
+	case ocispec.MediaTypeImageLayer:
+		compressionType = compression.Uncompressed
+	case ocispec.MediaTypeImageLayerGzip:
+		compressionType = compression.Gzip
+	case ocispec.MediaTypeImageLayerZstd:
+		compressionType = compression.Zstd
+	default:
+		return emptyDesc, fmt.Errorf("unsupported diff media type: %v: %w", config.MediaType, errdefs.ErrNotImplemented)
+	}
+
+	var newReference bool
+	if config.Reference == "" {
+		newReference = true
+		config.Reference = uniqueRef()
+	}
+
+	cw, err := s.store.Writer(ctx,
+		content.WithRef(config.Reference),
+		content.WithDescriptor(ocispec.Descriptor{
+			MediaType: config.MediaType, // most contentstore implementations just ignore this
+		}))
+	if err != nil {
+		return emptyDesc, fmt.Errorf("failed to open writer: %w", err)
+	}
+
+	// errOpen is set when an error occurs while the content writer has not been
+	// committed or closed yet to force a cleanup
+	var errOpen error
+	defer func() {
+		if errOpen != nil {
+			cw.Close()
+			if newReference {
+				if abortErr := s.store.Abort(ctx, config.Reference); abortErr != nil {
+					log.G(ctx).WithError(abortErr).WithField("ref", config.Reference).Warnf("failed to delete diff upload")
+				}
+			}
+		}
+	}()
+	if !newReference {
+		if errOpen = cw.Truncate(0); errOpen != nil {
+			return emptyDesc, errOpen
+		}
+	}
+
+	upperRoot := filepath.Join(layer, "fs")
+	if compressionType != compression.Uncompressed {
+		dgstr := digest.SHA256.Digester()
+		var compressed io.WriteCloser
+		if config.Compressor != nil {
+			compressed, errOpen = config.Compressor(cw, config.MediaType)
+			if errOpen != nil {
+				return emptyDesc, fmt.Errorf("failed to get compressed stream: %w", errOpen)
+			}
+		} else {
+			compressed, errOpen = compression.CompressStream(cw, compressionType)
+			if errOpen != nil {
+				return emptyDesc, fmt.Errorf("failed to get compressed stream: %w", errOpen)
+			}
+		}
+		errOpen = writeDiff(ctx, io.MultiWriter(compressed, dgstr.Hash()), lower, upperRoot)
+		compressed.Close()
+		if errOpen != nil {
+			return emptyDesc, fmt.Errorf("failed to write compressed diff: %w", errOpen)
+		}
+
+		if config.Labels == nil {
+			config.Labels = map[string]string{}
+		}
+		config.Labels[labels.LabelUncompressed] = dgstr.Digest().String()
+	} else {
+		err := writeDiff(ctx, cw, lower, upperRoot)
+		if err != nil {
+			return emptyDesc, fmt.Errorf("failed to create diff tar stream: %w", err)
+		}
+	}
+
+	var commitopts []content.Opt
+	if config.Labels != nil {
+		commitopts = append(commitopts, content.WithLabels(config.Labels))
+	}
+
+	dgst := cw.Digest()
+	if errOpen = cw.Commit(ctx, 0, dgst, commitopts...); errOpen != nil {
+		if !errdefs.IsAlreadyExists(errOpen) {
+			return emptyDesc, fmt.Errorf("failed to commit: %w", errOpen)
+		}
+		errOpen = nil
+	}
+
+	info, err := s.store.Info(ctx, dgst)
+	if err != nil {
+		return emptyDesc, fmt.Errorf("failed to get info from content store: %w", err)
+	}
+	if info.Labels == nil {
+		info.Labels = make(map[string]string)
+	}
+	// Set "containerd.io/uncompressed" label if digest already existed without label
+	if _, ok := info.Labels[labels.LabelUncompressed]; !ok {
+		info.Labels[labels.LabelUncompressed] = config.Labels[labels.LabelUncompressed]
+		if _, err := s.store.Update(ctx, info, "labels."+labels.LabelUncompressed); err != nil {
+			return emptyDesc, fmt.Errorf("error setting uncompressed label: %w", err)
+		}
+	}
+
+	return ocispec.Descriptor{
+		MediaType: config.MediaType,
+		Size:      info.Size,
+		Digest:    info.Digest,
+	}, nil
 }
