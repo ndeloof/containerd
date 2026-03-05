@@ -25,7 +25,6 @@ import (
 	iofs "io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 
 	cfs "github.com/containerd/continuity/fs"
 	"github.com/containerd/errdefs"
@@ -78,8 +77,13 @@ func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperRoot 
 }
 
 // extractEROFSToDir extracts the contents of an EROFS image into destDir,
-// applying AUFS overlay whiteout semantics so that multiple layers can be
+// applying overlayfs whiteout semantics so that multiple layers can be
 // merged by calling this function repeatedly (oldest layer first).
+//
+// mkfs.erofs --aufs converts AUFS-style whiteout files from the input tar into
+// overlayfs-native metadata in the resulting EROFS image:
+//   - deleted entries → character device with device number 0:0 (Rdev == 0)
+//   - opaque directories → directory with xattr trusted.overlay.opaque = "y"
 func extractEROFSToDir(blobPath, destDir string) error {
 	f, err := os.Open(blobPath)
 	if err != nil {
@@ -100,51 +104,40 @@ func extractEROFSToDir(blobPath, destDir string) error {
 			return nil
 		}
 
-		name := filepath.Base(path)
 		// filepath.FromSlash converts the forward-slash paths produced by
 		// io/fs.WalkDir into the OS-native separator (a no-op on macOS).
 		destPath := filepath.Join(destDir, filepath.FromSlash(path))
-
-		// Handle AUFS whiteout markers used by mkfs.erofs --aufs.
-		if strings.HasPrefix(name, ".wh.") {
-			if name == ".wh..wh..opq" {
-				// Opaque whiteout: the directory is opaque in this layer;
-				// remove all lower content that was previously extracted.
-				parentDir := filepath.Dir(destPath)
-				entries, rerr := os.ReadDir(parentDir)
-				if rerr != nil {
-					if os.IsNotExist(rerr) {
-						return nil
-					}
-					return rerr
-				}
-				for _, e := range entries {
-					if err := os.RemoveAll(filepath.Join(parentDir, e.Name())); err != nil {
-						return err
-					}
-				}
-				return nil
-			}
-			// Regular whiteout: delete the named entry from the merged tree.
-			toDelete := filepath.Join(filepath.Dir(destPath), strings.TrimPrefix(name, ".wh."))
-			if err := os.RemoveAll(toDelete); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			return nil
-		}
 
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
 		mode := info.Mode()
+		stat, _ := info.Sys().(*goerofs.Stat)
+
+		// Overlayfs whiteout: a character device with device number 0:0
+		// marks this path as deleted in the merged lower stack.
+		if mode&iofs.ModeCharDevice != 0 && stat != nil && stat.Rdev == 0 {
+			if err := os.RemoveAll(destPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			return nil
+		}
 
 		switch {
 		case mode.IsDir():
-			// A directory from a newer layer may overwrite a file from an
-			// older layer, so remove the old entry before creating the dir.
-			if err := os.RemoveAll(destPath); err != nil && !os.IsNotExist(err) {
-				return err
+			// Overlayfs opaque directory: all lower-layer content for this
+			// directory is hidden, so remove it before recreating.
+			if stat != nil && stat.Xattrs["trusted.overlay.opaque"] == "y" {
+				if err := os.RemoveAll(destPath); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			} else if fi, serr := os.Lstat(destPath); serr == nil && !fi.IsDir() {
+				// A non-dir (file/symlink) from a lower layer is being
+				// replaced by a directory; remove it first.
+				if err := os.Remove(destPath); err != nil {
+					return err
+				}
 			}
 			return os.MkdirAll(destPath, mode.Perm())
 
@@ -180,9 +173,9 @@ func extractEROFSToDir(blobPath, destDir string) error {
 			return copyErr
 
 		default:
-			// Skip device nodes, named pipes, sockets, etc. — these cannot
-			// be created on non-Linux hosts without elevated privileges and
-			// are not meaningful for diff generation.
+			// Skip non-whiteout device nodes, named pipes, sockets, etc. —
+			// these cannot be created on non-Linux hosts without elevated
+			// privileges and are not meaningful for diff generation.
 			return nil
 		}
 	})
